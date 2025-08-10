@@ -7,7 +7,7 @@ import { ShaderPass }     from 'three/examples/jsm/postprocessing/ShaderPass.js'
 const $ = (id)=>document.getElementById(id);
 const host = $("viewport");
 
-// ------- STATE (läst/skrivs av GUI via API när du vill) -------
+// ------- STATE -------
 const state = { timeOfDay:16, rain:0.4, wetness:0.5, fog:0.35, cloudiness:0.4, wind:0.3, exposure:1.0 };
 
 // ------- RENDERER -------
@@ -103,38 +103,94 @@ function makeWettable(mat){
   }
 }
 
-// ------- POST: regn-overlay -------
+// ------- POST: regn-overlay (fixade streck) -------
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
 const rainPass = new ShaderPass({
-  uniforms:{ tDiffuse:{value:null}, uTime:{value:0}, uRain:{value:state.rain}, uWind:{value:state.wind}, uExposure:{value:state.exposure} },
+  uniforms:{
+    tDiffuse:{ value:null },
+    uTime:{ value:0 },
+    uRain:{ value:state.rain },
+    uWind:{ value:state.wind },
+    uExposure:{ value:state.exposure },
+    uRes:{ value:new THREE.Vector2(host.clientWidth, host.clientHeight) } // <-- viktig
+  },
   vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}`,
   fragmentShader:`
-    precision highp float; uniform sampler2D tDiffuse; uniform float uTime,uRain,uWind,uExposure; varying vec2 vUv;
-    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
-    float rainStreaks(vec2 uv,float t,float intensity,float slant){
-      uv.x += slant*(uv.y*0.5); float d=0.0;
-      for(int i=0;i<3;i++){ float s=float(i+1); vec2 g=uv*vec2(1.0,6.0*s)+vec2(0.0,t*1.2*s);
-        float f=fract(g.y+hash(floor(vec2(g.x,g.y)))); float line=smoothstep(0.02,0.0,abs(f-0.5));
-        d+=line*(0.25+0.25*s); uv*=1.7; }
-      return d*intensity;
+    precision highp float;
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uRain, uWind, uExposure;
+    uniform vec2  uRes;
+    varying vec2 vUv;
+
+    float hash(float n){ return fract(sin(n)*43758.5453); }
+    float hash2(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+
+    vec2 rotate(vec2 p, float a){
+      float s=sin(a), c=cos(a);
+      return vec2(c*p.x - s*p.y, s*p.x + c*p.y);
     }
-    vec3 tone(vec3 c,float e){ c*=e; return c/(c+vec3(1.0)); }
+
+    // Vertikala/diagonala regnstreck (kolumnbaserade)
+    float rainStreaks(vec2 uv, float t, float intensity, float slant, vec2 res){
+      float aspect = res.x / max(1.0, res.y);
+      uv.x *= aspect;
+
+      // liten rotation för slant
+      float ang = radians(-20.0) * clamp(slant, 0.0, 1.0);
+      uv = rotate(uv - 0.5, ang) + 0.5;
+
+      // extra vind-shear
+      uv.x += slant * (uv.y * 0.25);
+
+      float d = 0.0;
+      for (int i=0; i<3; i++){
+        float s = float(i+1);
+        vec2 g = uv * vec2(60.0*s, 1.0);
+        float speed = 0.9 + 0.6*s;
+        g.y += t * speed;
+
+        float colId = floor(g.x);
+        float rnd = hash(colId*57.0 + float(i)*17.0);
+
+        float col = abs(fract(g.x) - 0.5);
+        float width = mix(0.012, 0.006, s/3.0);
+        float line = smoothstep(width, 0.0, col);
+
+        float head = fract(g.y + rnd);
+        float dash = smoothstep(0.00, 0.15, head) * smoothstep(1.00, 0.85, head);
+
+        d += line * dash * (0.35 + 0.25*s);
+      }
+      return d * clamp(intensity, 0.0, 1.0);
+    }
+
+    vec3 tone(vec3 c, float exposure){
+      c *= exposure;
+      return c / (c + vec3(1.0));
+    }
+
     void main(){
-      vec3 base=texture2D(tDiffuse,vUv).rgb;
-      float slant=mix(0.0,0.35,uWind);
-      float streak=rainStreaks(vUv,uTime*0.7,uRain,slant);
-      vec3 rainTint=mix(vec3(0.0),vec3(0.12,0.16,0.20),clamp(uRain*0.9,0.0,1.0));
-      vec3 col=base*(1.0-uRain*0.08)+rainTint+vec3(streak)*0.12;
-      gl_FragColor=vec4(tone(col,uExposure),1.0);
-    }`
+      vec3 base = texture2D(tDiffuse, vUv).rgb;
+
+      float streak = rainStreaks(vUv, uTime*0.7, uRain, uWind, uRes);
+
+      vec3 rainTint = mix(vec3(0.0), vec3(0.12,0.16,0.20), clamp(uRain*0.9,0.0,1.0));
+      vec3 col = base*(1.0 - uRain*0.08) + rainTint + vec3(streak)*0.12;
+
+      gl_FragColor = vec4(tone(col, uExposure), 1.0);
+    }
+  `
 });
 composer.addPass(rainPass);
 
 // ------- RESIZE -------
 addEventListener('resize', ()=>{
   const w=host.clientWidth, h=host.clientHeight;
-  renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix();
+  renderer.setSize(w,h);
+  camera.aspect=w/h;
+  camera.updateProjectionMatrix();
+  rainPass.uniforms.uRes.value.set(w,h); // <-- uppdatera upplösning till shaddern
 });
 
 // ------- FRAME UPDATE -------
@@ -171,6 +227,5 @@ function tick(){
 }
 tick();
 
-// Exponera state till konsolen vid behov (debugga snabbt)
 window.__RainSimState = state;
 console.log('RainSim 3D scene booted');
