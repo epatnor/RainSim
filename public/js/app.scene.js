@@ -8,7 +8,10 @@ const $ = (id)=>document.getElementById(id);
 const host = $("viewport");
 
 // ------- STATE -------
-const state = { timeOfDay:16, rain:0.4, wetness:0.5, fog:0.35, cloudiness:0.4, wind:0.3, exposure:1.0 };
+const state = {
+  timeOfDay: 16, rain: 0.4, wetness: 0.5, fog: 0.35, cloudiness: 0.4, wind: 0.3, exposure: 1.0,
+  weatherDensity: 2 // 0..3 (WoW-lik diskret densitet)
+};
 
 // ------- RENDERER -------
 const renderer = new THREE.WebGLRenderer({ antialias:false, powerPreference:'high-performance' });
@@ -73,8 +76,7 @@ function makeWettable(mat){
     new THREE.PlaneGeometry(60, 40),
     makeWettable(new THREE.MeshStandardMaterial({ color:0x7f8992, roughness:0.88, metalness:0.02 }))
   );
-  ground.rotation.x = -Math.PI/2;
-  scene.add(ground);
+  ground.rotation.x = -Math.PI/2; scene.add(ground);
 
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(4,3,3),
@@ -103,7 +105,7 @@ function makeWettable(mat){
   }
 }
 
-// ------- POST: regn-overlay (fixade streck) -------
+// ------- POST: WoW-lik regn-overlay -------
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
 const rainPass = new ShaderPass({
@@ -113,70 +115,68 @@ const rainPass = new ShaderPass({
     uRain:{ value:state.rain },
     uWind:{ value:state.wind },
     uExposure:{ value:state.exposure },
-    uRes:{ value:new THREE.Vector2(host.clientWidth, host.clientHeight) } // <-- viktig
+    uRes:{ value:new THREE.Vector2(host.clientWidth, host.clientHeight) },
+    uDensity:{ value: state.weatherDensity } // 0..3
   },
   vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}`,
   fragmentShader:`
     precision highp float;
     uniform sampler2D tDiffuse;
-    uniform float uTime, uRain, uWind, uExposure;
+    uniform float uTime, uRain, uWind, uExposure, uDensity;
     uniform vec2  uRes;
     varying vec2 vUv;
 
     float hash(float n){ return fract(sin(n)*43758.5453); }
-    float hash2(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
 
     vec2 rotate(vec2 p, float a){
       float s=sin(a), c=cos(a);
       return vec2(c*p.x - s*p.y, s*p.x + c*p.y);
     }
 
-    // Vertikala/diagonala regnstreck (kolumnbaserade)
-    float rainStreaks(vec2 uv, float t, float intensity, float slant, vec2 res){
-      float aspect = res.x / max(1.0, res.y);
+    // Ett "WoW-lager": kolumnstreck med discrete dash
+    float rainLayer(vec2 uv, float t, float columns, float speed, float width, float slant){
+      float aspect = uRes.x / max(1.0, uRes.y);
       uv.x *= aspect;
 
-      // liten rotation för slant
-      float ang = radians(-20.0) * clamp(slant, 0.0, 1.0);
+      float ang = radians(-18.0) * clamp(slant, 0.0, 1.0);
       uv = rotate(uv - 0.5, ang) + 0.5;
+      uv.x += slant * (uv.y * 0.22);
 
-      // extra vind-shear
-      uv.x += slant * (uv.y * 0.25);
+      vec2 g = uv * vec2(columns, 1.0);
+      float colId = floor(g.x);
+      float rnd   = hash(colId*57.0 + floor(t)*13.0);
 
-      float d = 0.0;
-      for (int i=0; i<3; i++){
-        float s = float(i+1);
-        vec2 g = uv * vec2(60.0*s, 1.0);
-        float speed = 0.9 + 0.6*s;
-        g.y += t * speed;
+      float col = abs(fract(g.x) - 0.5);
+      float line = smoothstep(width, 0.0, col);
 
-        float colId = floor(g.x);
-        float rnd = hash(colId*57.0 + float(i)*17.0);
+      float y = g.y + t*speed + rnd;
+      float seg = fract(y);
+      float dash = step(0.05, seg) * step(seg, 0.35);
 
-        float col = abs(fract(g.x) - 0.5);
-        float width = mix(0.012, 0.006, s/3.0);
-        float line = smoothstep(width, 0.0, col);
-
-        float head = fract(g.y + rnd);
-        float dash = smoothstep(0.00, 0.15, head) * smoothstep(1.00, 0.85, head);
-
-        d += line * dash * (0.35 + 0.25*s);
-      }
-      return d * clamp(intensity, 0.0, 1.0);
+      float amp = mix(0.55, 1.0, hash(colId*91.0));
+      return line * dash * amp;
     }
 
-    vec3 tone(vec3 c, float exposure){
-      c *= exposure;
-      return c / (c + vec3(1.0));
-    }
+    vec3 tone(vec3 c, float e){ c*=e; return c/(c+vec3(1.0)); }
 
     void main(){
-      vec3 base = texture2D(tDiffuse, vUv).rgb;
+      vec3 sceneCol = texture2D(tDiffuse, vUv).rgb;
+      int d = int(clamp(uDensity, 0.0, 3.0));
+      float slant = clamp(uWind, 0.0, 1.0);
+      float t = uTime;
 
-      float streak = rainStreaks(vUv, uTime*0.7, uRain, uWind, uRes);
+      float acc = 0.0;
+      if (d >= 1){ acc += rainLayer(vUv, t*1.00, 28.0, 1.0, 0.020, slant); }
+      if (d >= 2){ acc += rainLayer(vUv, t*1.25, 40.0, 1.3, 0.016, slant); }
+      if (d >= 3){ acc += rainLayer(vUv, t*1.55, 58.0, 1.6, 0.012, slant); }
 
-      vec3 rainTint = mix(vec3(0.0), vec3(0.12,0.16,0.20), clamp(uRain*0.9,0.0,1.0));
-      vec3 col = base*(1.0 - uRain*0.08) + rainTint + vec3(streak)*0.12;
+      acc *= clamp(uRain * (0.7 + float(d)*0.3), 0.0, 1.6);
+
+      vec3 rainTint = vec3(0.12, 0.16, 0.20) * min(1.0, uRain*0.9 + float(d)*0.2);
+      vec3 col = sceneCol * (1.0 - 0.06*uRain - 0.04*float(d)) + rainTint;
+
+      // enkel additive highlight
+      col += vec3(0.55) * acc * 0.18;
 
       gl_FragColor = vec4(tone(col, uExposure), 1.0);
     }
@@ -190,12 +190,15 @@ addEventListener('resize', ()=>{
   renderer.setSize(w,h);
   camera.aspect=w/h;
   camera.updateProjectionMatrix();
-  rainPass.uniforms.uRes.value.set(w,h); // <-- uppdatera upplösning till shaddern
+  rainPass.uniforms.uRes.value.set(w,h);
 });
 
 // ------- FRAME UPDATE -------
 const tmpCol = new THREE.Color();
 function updateVisuals(){
+  // diskret WoW-känsla: mappa slider till 0..3
+  state.weatherDensity = Math.min(3, Math.floor(state.rain * 4.0 + 0.001));
+
   const t=state.timeOfDay, elev=Math.cos((t-12)*Math.PI/12), height=Math.max(0.0,elev), azim=(t/24.0)*Math.PI*2.0;
   sun.position.set(Math.sin(azim)*20, 8+height*30, Math.cos(azim)*20);
   sun.intensity=0.2+1.4*height; amb.intensity=0.15+0.35*Math.max(0.0,height);
@@ -214,18 +217,15 @@ function updateVisuals(){
     }
   });
 
-  rainPass.uniforms.uRain.value=state.rain;
-  rainPass.uniforms.uWind.value=state.wind;
-  rainPass.uniforms.uExposure.value=state.exposure;
-  rainPass.uniforms.uTime.value=performance.now()*0.001;
+  rainPass.uniforms.uRain.value     = state.rain;
+  rainPass.uniforms.uWind.value     = state.wind;
+  rainPass.uniforms.uExposure.value = state.exposure;
+  rainPass.uniforms.uTime.value     = performance.now()*0.001;
+  rainPass.uniforms.uDensity.value  = state.weatherDensity;
 }
 
-function tick(){
-  updateVisuals();
-  composer.render();
-  requestAnimationFrame(tick);
-}
+function tick(){ updateVisuals(); composer.render(); requestAnimationFrame(tick); }
 tick();
 
 window.__RainSimState = state;
-console.log('RainSim 3D scene booted');
+console.log('RainSim 3D scene booted (WoW rain)');
